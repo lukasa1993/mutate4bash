@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mutate4bash"
+version = "0.1.0"
+description = "Mutation testing for Bash scripts"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [{name = "lukasa1993"}]
+classifiers = ["Development Status :: 3 - Alpha", "License :: OSI Approved :: MIT License", "Programming Language :: Python :: 3"]
+
+[project.scripts]
+mutate4bash = "mutate4bash.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

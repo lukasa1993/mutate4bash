@@ -1,17 +1,17 @@
 # mutate4bash
 
-`mutate4bash` performs safe one-at-a-time mutation testing for Bash scripts. It ignores comments and quoted strings and checks each mutated file with `bash -n` before the test command.
-
-## Install
+`mutate4bash` performs syntax-aware mutation testing for Bash. It verifies the baseline, restores source through a crash-recovery journal, separates timeouts and compile errors from killed mutants, and writes a versioned JSON manifest.
 
 ```bash
 pipx install git+https://github.com/lukasa1993/mutate4bash.git
+mutate4bash --test-command "<project test command>" --validate-command "<project build command>"
 ```
 
-## Run
+Compiled C-family projects require a detected or explicit validation command. Timeouts, invalid syntax, and compile errors return status `1`; surviving mutants return status `2`.
+
+## Development
 
 ```bash
-mutate4bash --test-command "bats tests" --fail-on-survivors
+python -m pip install -e . pytest
+pytest -q
 ```
-
-The default manifest is `target/mutation/mutations.json`. Use `--list`, `--max-mutants`, and path fragments to control the run.

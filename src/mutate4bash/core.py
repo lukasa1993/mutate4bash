@@ -1,144 +1,56 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-
-@dataclass(frozen=True)
-class Token:
-    value: str
-    kind: str
-    line: int
-    column: int
-    start: int
-    end: int
-
-
-OPERATORS = ("[[", "]]", "&&", "||", ";;", ";&", ";;&", "<<-", "<<<", ">>", "<<", "==", "!=", "=~", ">=", "<=", "&>", ">&", "|&")
-TEST_OPERATORS = ("-eq", "-ne", "-gt", "-ge", "-lt", "-le")
-
-
-def tokenize(text: str) -> list[Token]:
-    out: list[Token] = []
-    index = 0
-    line = 1
-    column = 1
-    at_word_start = True
-
-    def advance(fragment: str) -> None:
-        nonlocal line, column, at_word_start
-        if "\n" in fragment:
-            line += fragment.count("\n")
-            column = len(fragment.rsplit("\n", 1)[-1]) + 1
-            at_word_start = True
-        else:
-            column += len(fragment)
-
-    while index < len(text):
-        start = index
-        start_line = line
-        start_column = column
-        character = text[index]
-        if character.isspace():
-            index += 1
-            while index < len(text) and text[index].isspace():
-                index += 1
-            advance(text[start:index])
-            continue
-        if character == "#" and (at_word_start or index == 0):
-            end = text.find("\n", index)
-            index = len(text) if end < 0 else end
-            advance(text[start:index])
-            continue
-        if character in {"'", '"', '`'}:
-            quote = character
-            index += 1
-            escaped = False
-            while index < len(text):
-                current = text[index]
-                index += 1
-                if quote == "'":
-                    if current == quote:
-                        break
-                elif escaped:
-                    escaped = False
-                elif current == "\\":
-                    escaped = True
-                elif current == quote:
-                    break
-            fragment = text[start:index]
-            out.append(Token(fragment, "string", start_line, start_column, start, index))
-            advance(fragment)
-            at_word_start = False
-            continue
-        test_operator = next((value for value in TEST_OPERATORS if text.startswith(value, index) and (index + len(value) == len(text) or not text[index + len(value)].isalnum())), None)
-        operator = test_operator or next((value for value in OPERATORS if text.startswith(value, index)), None)
-        if operator:
-            index += len(operator)
-            out.append(Token(operator, "operator", start_line, start_column, start, index))
-            advance(operator)
-            at_word_start = operator in {";", ";;", "&&", "||", "|"}
-            continue
-        if character.isalpha() or character == "_":
-            index += 1
-            while index < len(text) and (text[index].isalnum() or text[index] == "_"):
-                index += 1
-            fragment = text[start:index]
-            out.append(Token(fragment, "identifier", start_line, start_column, start, index))
-            advance(fragment)
-            at_word_start = False
-            continue
-        if character.isdigit():
-            index += 1
-            while index < len(text) and text[index].isdigit():
-                index += 1
-            fragment = text[start:index]
-            out.append(Token(fragment, "number", start_line, start_column, start, index))
-            advance(fragment)
-            at_word_start = False
-            continue
-        index += 1
-        out.append(Token(character, "operator", start_line, start_column, start, index))
-        advance(character)
-        at_word_start = character in {";", "|", "&", "("}
-    return out
-
-
-import os
-from pathlib import Path
-from typing import Sequence
-
-EXCLUDED_DIRS = {".git", ".hg", ".bats", "coverage", "node_modules", "target", "vendor"}
-
-
-def discover_files(root: Path, filters: Sequence[str] = ()) -> list[Path]:
-    files: list[Path] = []
-    for directory, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(name for name in dirnames if name not in EXCLUDED_DIRS and name not in {"test", "tests"})
-        for filename in sorted(filenames):
-            path = Path(directory, filename)
-            if path.suffix not in {".sh", ".bash"}:
-                try:
-                    first = path.open(encoding="utf-8", errors="ignore").readline()
-                except OSError:
-                    continue
-                if "bash" not in first and "sh" not in first:
-                    continue
-            relative = path.relative_to(root).as_posix()
-            if filters and not any(fragment in relative for fragment in filters):
-                continue
-            files.append(path)
-    return files
-
-
+import base64
 import json
+import os
+import re
+import shutil
+import signal
 import subprocess
+import tempfile
+import time
 from dataclasses import asdict, dataclass
-from typing import Iterable
+from pathlib import Path
+from typing import Any, Iterable, Iterator, Sequence
 
-REPLACEMENTS = {
-    "==": "!=", "!=": "==", "-eq": "-ne", "-ne": "-eq", "-gt": "-le", "-le": "-gt", "-lt": "-ge", "-ge": "-lt",
+from tree_sitter_language_pack import get_parser
+
+LANGUAGE = 'bash'
+PARSER_BY_EXTENSION = {}
+DISPLAY_LANGUAGE = 'Bash'
+EXTENSIONS = ('.sh', '.bash')
+EXCLUDED_DIRS = frozenset(('.git', '.hg', '.idea', '.pytest_cache', '.tox', '.venv', '.build', 'build', 'coverage', 'dist', 'node_modules', 'target', 'vendor', 'venv', 'DerivedData', 'Pods'))
+TEST_DIRS = frozenset(('tests', 'test'))
+TEST_SUFFIXES = ('.bats',)
+JOURNAL_PATH = Path("target/mutation/active.json")
+
+SKIPPED_ANCESTORS = frozenset({
+    "comment", "line_comment", "block_comment", "string_literal", "raw_string_literal",
+    "char_literal", "heredoc_body", "heredoc_redirect", "word", "string", "interpreted_string_literal",
+})
+BINARY_PARENTS = frozenset({
+    "binary_expression", "logical_expression", "boolean_expression", "test_expression",
+    "arithmetic_expression", "compound_expression", "comparison_expression", "binary_operator", "boolean_operator",
+})
+COMMON_REPLACEMENTS = {
+    "==": "!=", "!=": "==", ">": "<=", "<": ">=", ">=": "<", "<=": ">",
     "&&": "||", "||": "&&", "true": "false", "false": "true",
 }
+LANGUAGE_REPLACEMENTS = {
+    "typescript": {},
+    "python": {"True": "False", "False": "True", "and": "or", "or": "and"},
+    "rust": {},
+    "swift": {},
+    "objc": {"YES": "NO", "NO": "YES"},
+    "bash": {"-eq": "-ne", "-ne": "-eq", "-gt": "-le", "-ge": "-lt", "-lt": "-ge", "-le": "-gt"},
+    "c": {},
+    "cpp": {},
+}[LANGUAGE]
+ARITHMETIC_REPLACEMENTS = {"+": "-", "-": "+", "*": "/", "/": "*"}
+
+
+class MutationError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -152,65 +64,306 @@ class Mutation:
     start: int
     end: int
 
-    def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+    def public_dict(self) -> dict[str, object]:
+        value = asdict(self)
+        value.pop("start")
+        value.pop("end")
+        return value
 
 
 @dataclass(frozen=True)
-class Result:
+class CommandResult:
+    returncode: int | None
+    timed_out: bool
+    duration_seconds: float
+    output: str
+
+
+@dataclass(frozen=True)
+class MutationResult:
     mutation: Mutation
     status: str
     exit_code: int | None
+    duration_seconds: float
+    detail: str | None = None
 
     def to_dict(self) -> dict[str, object]:
-        return {**self.mutation.to_dict(), "status": self.status, "exit_code": self.exit_code}
+        return {**self.mutation.public_dict(), "status": self.status, "exit_code": self.exit_code,
+                "duration_seconds": round(self.duration_seconds, 3), "detail": self.detail}
+
+
+def _is_test_path(relative: str) -> bool:
+    path = Path(relative)
+    if any(part in TEST_DIRS or part.lower() in {value.lower() for value in TEST_DIRS} for part in path.parts):
+        return True
+    return path.name.endswith(TEST_SUFFIXES)
+
+
+def discover_files(root: Path, filters: Sequence[str] = (), include_tests: bool = False) -> list[Path]:
+    output: list[Path] = []
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in EXCLUDED_DIRS)
+        for filename in sorted(filenames):
+            if not filename.endswith(EXTENSIONS):
+                continue
+            path = Path(directory, filename)
+            relative = path.relative_to(root).as_posix()
+            if not include_tests and _is_test_path(relative):
+                continue
+            if filters and not any(fragment in relative for fragment in filters):
+                continue
+            output.append(path)
+    return output
+
+
+def _walk(node: Any) -> Iterator[Any]:
+    yield node
+    for child in node.children:
+        yield from _walk(child)
+
+
+def _node_text(node: Any, source: bytes) -> str:
+    return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
+
+def _ancestor_types(node: Any) -> set[str]:
+    result: set[str] = set()
+    parent = getattr(node, "parent", None)
+    while parent is not None:
+        result.add(parent.type)
+        parent = getattr(parent, "parent", None)
+    return result
+
+
+def _point(node: Any) -> tuple[int, int]:
+    point = node.start_point
+    if hasattr(point, "row"):
+        return int(point.row) + 1, int(point.column) + 1
+    return int(point[0]) + 1, int(point[1]) + 1
+
+
+def _candidate(node: Any, source: bytes) -> str | None:
+    if node.children:
+        return None
+    if _ancestor_types(node) & SKIPPED_ANCESTORS:
+        return None
+    text = _node_text(node, source)
+    replacement = LANGUAGE_REPLACEMENTS.get(text, COMMON_REPLACEMENTS.get(text))
+    if replacement is not None:
+        return replacement
+    parent = getattr(node, "parent", None)
+    if text in ARITHMETIC_REPLACEMENTS and parent is not None and parent.type in BINARY_PARENTS:
+        return ARITHMETIC_REPLACEMENTS[text]
+    return None
+
+
+def parser_for_path(path: Path) -> Any:
+    return get_parser(PARSER_BY_EXTENSION.get(path.suffix.lower(), LANGUAGE))
+
+
+def parse_valid(source: bytes, path: Path) -> bool:
+    return not parser_for_path(path).parse(source).root_node.has_error
 
 
 def enumerate_mutations(path: Path, root: Path, start_id: int = 1) -> list[Mutation]:
-    out: list[Mutation] = []
-    for token in tokenize(path.read_text(encoding="utf-8")):
-        replacement = REPLACEMENTS.get(token.value)
-        if replacement:
-            out.append(Mutation(start_id + len(out), path.relative_to(root).as_posix(), token.line, token.column, token.value, replacement, token.start, token.end))
-    return out
+    source = path.read_bytes()
+    tree = parser_for_path(path).parse(source)
+    if tree.root_node.has_error:
+        raise MutationError(f"source contains parse errors: {path}")
+    candidates: list[Mutation] = []
+    relative = path.relative_to(root).as_posix()
+    for node in _walk(tree.root_node):
+        replacement = _candidate(node, source)
+        if replacement is None:
+            continue
+        original = _node_text(node, source)
+        line, column = _point(node)
+        candidates.append(Mutation(0, relative, line, column, original, replacement, node.start_byte, node.end_byte))
+    candidates.sort(key=lambda item: (item.start, -(item.end - item.start), item.replacement))
+    selected: list[Mutation] = []
+    last_end = -1
+    for mutation in candidates:
+        if mutation.start < last_end:
+            continue
+        selected.append(Mutation(start_id + len(selected), **{key: value for key, value in asdict(mutation).items() if key != "id"}))
+        last_end = mutation.end
+    return selected
 
 
-def collect_mutations(root: Path, filters: Sequence[str] = ()) -> list[Mutation]:
-    out: list[Mutation] = []
-    for path in discover_files(root, filters):
-        out.extend(enumerate_mutations(path, root, len(out) + 1))
-    return out
+def collect_mutations(root: Path, filters: Sequence[str] = (), include_tests: bool = False) -> list[Mutation]:
+    output: list[Mutation] = []
+    for path in discover_files(root, filters, include_tests):
+        output.extend(enumerate_mutations(path, root, len(output) + 1))
+    return output
 
 
-def run_mutations(root: Path, mutations: Iterable[Mutation], command: str, timeout: float, max_mutants: int | None = None) -> list[Result]:
-    results: list[Result] = []
+def run_command(command: str, root: Path, timeout_seconds: float) -> CommandResult:
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        cwd=root,
+        shell=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=(os.name != "nt"),
+    )
+    try:
+        output, _ = process.communicate(timeout=timeout_seconds)
+        return CommandResult(process.returncode, False, time.monotonic() - started, output or "")
+    except subprocess.TimeoutExpired:
+        if os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        else:
+            process.kill()
+        output, _ = process.communicate()
+        return CommandResult(None, True, time.monotonic() - started, output or "")
+
+
+def _atomic_write(path: Path, data: bytes, mode: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if mode is not None:
+            os.chmod(name, mode)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def recover_active(root: Path) -> bool:
+    journal = root / JOURNAL_PATH
+    if not journal.exists():
+        return False
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    path = root / str(payload["file"])
+    original = base64.b64decode(str(payload["content"]))
+    mode = int(payload.get("mode", 0o644))
+    _atomic_write(path, original, mode)
+    journal.unlink(missing_ok=True)
+    return True
+
+
+class SourceMutation:
+    def __init__(self, root: Path, mutation: Mutation):
+        self.root = root
+        self.mutation = mutation
+        self.path = root / mutation.file
+        self.original = self.path.read_bytes()
+        self.mode = self.path.stat().st_mode
+        self.journal = root / JOURNAL_PATH
+
+    def __enter__(self) -> Path:
+        self.journal.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"file": self.mutation.file, "content": base64.b64encode(self.original).decode("ascii"), "mode": self.mode}
+        _atomic_write(self.journal, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"), 0o600)
+        mutated = self.original[: self.mutation.start] + self.mutation.replacement.encode() + self.original[self.mutation.end :]
+        _atomic_write(self.path, mutated, self.mode)
+        return self.path
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        _atomic_write(self.path, self.original, self.mode)
+        self.journal.unlink(missing_ok=True)
+
+
+def detect_test_command(root: Path) -> str | None:
+    configured = 'bats tests'
+    if configured:
+        return configured
+    if (root / "build" / "CTestTestfile.cmake").exists():
+        return "ctest --test-dir build --output-on-failure"
+    makefile = root / "Makefile"
+    if makefile.exists() and re.search(r"(?m)^test\s*:", makefile.read_text(encoding="utf-8", errors="ignore")):
+        return "make test"
+    return None
+
+
+def detect_validation_command(root: Path) -> str | None:
+    configured = ''
+    if configured:
+        return configured
+    if (root / "build" / "build.ninja").exists():
+        return "ninja -C build"
+    if (root / "build" / "CMakeCache.txt").exists():
+        return "cmake --build build"
+    if (root / "Makefile").exists():
+        return "make -s"
+    return None
+
+
+def _bash_validate(path: Path, root: Path, timeout_seconds: float) -> CommandResult | None:
+    if LANGUAGE != "bash":
+        return None
+    relative = path.relative_to(root).as_posix()
+    return run_command(f"bash -n {shlex_quote(relative)}", root, timeout_seconds)
+
+
+def shlex_quote(value: str) -> str:
+    import shlex
+    return shlex.quote(value)
+
+
+def run_mutations(
+    root: Path,
+    mutations: Iterable[Mutation],
+    test_command: str,
+    timeout_seconds: float,
+    validation_command: str | None,
+    max_mutants: int | None = None,
+) -> list[MutationResult]:
+    recover_active(root)
+    results: list[MutationResult] = []
     for mutation in mutations:
         if max_mutants is not None and len(results) >= max_mutants:
             break
-        path = root / mutation.file
-        original_text = path.read_text(encoding="utf-8")
-        path.write_text(original_text[:mutation.start] + mutation.replacement + original_text[mutation.end:], encoding="utf-8")
-        try:
-            syntax = subprocess.run(["bash", "-n", str(path)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if syntax.returncode:
-                results.append(Result(mutation, "killed", syntax.returncode))
+        with SourceMutation(root, mutation) as path:
+            mutated = path.read_bytes()
+            if not parse_valid(mutated, path):
+                results.append(MutationResult(mutation, "invalid", None, 0.0, "mutated source does not parse"))
                 continue
-            try:
-                completed = subprocess.run(command, cwd=root, shell=True, timeout=timeout, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                results.append(Result(mutation, "survived" if completed.returncode == 0 else "killed", completed.returncode))
-            except subprocess.TimeoutExpired:
-                results.append(Result(mutation, "timeout", None))
-        finally:
-            path.write_text(original_text, encoding="utf-8")
+            validation = _bash_validate(path, root, timeout_seconds)
+            if validation is None and validation_command:
+                validation = run_command(validation_command, root, timeout_seconds)
+            if validation is not None:
+                if validation.timed_out:
+                    results.append(MutationResult(mutation, "timeout", None, validation.duration_seconds, "validation timed out"))
+                    continue
+                if validation.returncode != 0:
+                    results.append(MutationResult(mutation, "compile-error", validation.returncode, validation.duration_seconds, validation.output[-2000:]))
+                    continue
+            execution = run_command(test_command, root, timeout_seconds)
+            if execution.timed_out:
+                status = "timeout"
+                detail = "test command timed out"
+            elif execution.returncode == 0:
+                status = "survived"
+                detail = None
+            else:
+                status = "killed"
+                detail = None
+            results.append(MutationResult(mutation, status, execution.returncode, execution.duration_seconds, detail))
     return results
 
 
-def run_baseline(root: Path, command: str, timeout: float) -> None:
-    completed = subprocess.run(command, cwd=root, shell=True, timeout=timeout, check=False)
-    if completed.returncode:
-        raise RuntimeError(f"baseline tests failed with status {completed.returncode}")
-
-
-def write_manifest(path: Path, results: Iterable[Result]) -> None:
+def write_manifest(path: Path, tool: str, version: str, root: Path, results: Sequence[MutationResult]) -> None:
+    counts: dict[str, int] = {}
+    for result in results:
+        counts[result.status] = counts.get(result.status, 0) + 1
+    payload = {
+        "schema_version": 1,
+        "tool": tool,
+        "version": version,
+        "root": root.as_posix(),
+        "summary": {"total": len(results), **counts},
+        "mutants": [result.to_dict() for result in results],
+    }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps([result.to_dict() for result in results], indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _atomic_write(path, (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"), 0o644)
